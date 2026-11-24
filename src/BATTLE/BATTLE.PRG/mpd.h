@@ -204,7 +204,7 @@ typedef struct {
     MpdRoomCollisionMapSection* collisionMapSection;
     MpdTile* tileMap;
     vs_Warp* doorSection;
-    int lightingSection;
+    void* lightingSection;
     int section6;
     int section7;
     int section8;
