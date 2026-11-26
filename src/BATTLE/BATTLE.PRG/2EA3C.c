@@ -186,7 +186,7 @@ static void rotTrans(SVECTOR* in, VECTOR* out)
     RotTrans(in, out, &flag);
 }
 
-static void projectPoint(SVECTOR* in, DVECTOR* outXy, short* outZ)
+static void projectPoint(SVECTOR* in, DVECTOR* outXy, int* outZ)
 {
     long sxy;
     long unused;
@@ -202,7 +202,7 @@ static void projectPoint(SVECTOR* in, DVECTOR* outXy, short* outZ)
 }
 
 static void projectPoints3(SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, DVECTOR* xy0,
-    DVECTOR* xy1, DVECTOR* xy2, short* z0, short* z1, short* z2)
+    DVECTOR* xy1, DVECTOR* xy2, int* z0, int* z1, int* z2)
 {
     long sxy0;
     long sxy1;
@@ -247,7 +247,7 @@ static int isPolyVisible(DVECTOR sxy0, DVECTOR sxy1, DVECTOR sxy2, DVECTOR sxy3)
     return 1;
 }
 
-static int insertPrim(void* prim, u_long* ot, u_int depth, int depthOffset)
+static int insertPrim(void* prim, u_long* ot, u_int depth, int depthOffset, int* outOtz)
 {
     int otz = depth >> 2;
 
@@ -262,6 +262,11 @@ static int insertPrim(void* prim, u_long* ot, u_int depth, int depthOffset)
     }
 
     AddPrim(&ot[otz], prim);
+
+    if (outOtz != NULL) {
+        *outOtz = otz;
+    }
+
     return 1;
 }
 
@@ -283,6 +288,9 @@ static void subdivideTri(
     SubdivVertex m01;
     SubdivVertex m21;
     SubdivVertex m20;
+    int sz0;
+    int sz1;
+    int sz2;
 
     if (depth == 0) {
         POLY_GT3* poly = (POLY_GT3*)ctx->nextPrim;
@@ -304,7 +312,7 @@ static void subdivideTri(
 
         setPolyGT3(poly);
 
-        if (!insertPrim(poly, ctx->ot, maxZ, ctx->depthOffset)) {
+        if (!insertPrim(poly, ctx->ot, maxZ, ctx->depthOffset, NULL)) {
             return;
         }
 
@@ -324,8 +332,11 @@ static void subdivideTri(
     midpointVertex(&m01, v0, v1);
     midpointVertex(&m21, v2, v1);
     midpointVertex(&m20, v2, v0);
-    projectPoints3(&m01.pos, &m21.pos, &m20.pos, &m01.sxy, &m21.sxy, &m20.sxy, &m01.sz,
-        &m21.sz, &m20.sz);
+    projectPoints3(
+        &m01.pos, &m21.pos, &m20.pos, &m01.sxy, &m21.sxy, &m20.sxy, &sz0, &sz1, &sz2);
+    m01.sz = sz0;
+    m21.sz = sz1;
+    m20.sz = sz2;
 
     --depth;
     subdivideTri(ctx, depth, v0, &m01, &m20);
@@ -346,6 +357,9 @@ static void subdivideQuad(SubdivContext* ctx, int depth, SubdivVertex* v0,
     SubdivVertex m32;
     SubdivVertex m02;
     SubdivVertex mc;
+    int sz0;
+    int sz1;
+    int sz2;
 
     if (depth == 0) {
         POLY_GT4* poly = (POLY_GT4*)ctx->nextPrim;
@@ -371,7 +385,7 @@ static void subdivideQuad(SubdivContext* ctx, int depth, SubdivVertex* v0,
 
         setPolyGT4(poly);
 
-        if (!insertPrim(poly, ctx->ot, maxZ, ctx->depthOffset)) {
+        if (!insertPrim(poly, ctx->ot, maxZ, ctx->depthOffset, NULL)) {
             return;
         }
 
@@ -392,13 +406,18 @@ static void subdivideQuad(SubdivContext* ctx, int depth, SubdivVertex* v0,
     midpointVertex(&m01, v0, v1);
     midpointVertex(&mc, v2, v1);
     midpointVertex(&m31, v3, v1);
-    projectPoints3(&m01.pos, &mc.pos, &m31.pos, &m01.sxy, &mc.sxy, &m31.sxy, &m01.sz,
-        &mc.sz, &m31.sz);
+    projectPoints3(
+        &m01.pos, &mc.pos, &m31.pos, &m01.sxy, &mc.sxy, &m31.sxy, &sz0, &sz1, &sz2);
+    m01.sz = sz0;
+    mc.sz = sz1;
+    m31.sz = sz2;
 
     midpointVertex(&m32, v3, v2);
     midpointVertex(&m02, v0, v2);
-    projectPoint(&m32.pos, &m32.sxy, &m32.sz);
-    projectPoint(&m02.pos, &m02.sxy, &m02.sz);
+    projectPoint(&m32.pos, &m32.sxy, &sz0);
+    projectPoint(&m02.pos, &m02.sxy, &sz1);
+    m32.sz = sz0;
+    m02.sz = sz1;
 
     --depth;
     subdivideQuad(ctx, depth, v0, &m01, &m02, &mc);
@@ -427,9 +446,9 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
         DVECTOR sxy0;
         DVECTOR sxy1;
         DVECTOR sxy2;
-        short sz0;
-        short sz1;
-        short sz2;
+        int sz0;
+        int sz1;
+        int sz2;
         int area;
         u_int absArea;
         int maxZ;
@@ -510,6 +529,8 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
             subdivideTri(ctx, subdivDepth, &v0, &v1, &v2);
         } else {
             POLY_GT3* poly = (POLY_GT3*)ctx->nextPrim;
+            int otz;
+            u_int otzU;
             u_char u0;
             u_char v0;
             u_char u1;
@@ -520,7 +541,7 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
 
             setPolyGT3(poly);
 
-            if (!insertPrim(poly, ctx->ot, depthU, ctx->depthOffset)) {
+            if (!insertPrim(poly, ctx->ot, depthU, ctx->depthOffset, &otz)) {
                 continue;
             }
 
@@ -537,8 +558,9 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
             u2 = tri->u2;
             v2 = tri->v2;
             tpage = tri->tpage;
+            otzU = otz;
 
-            if (depthU >= fogThreshold) {
+            if (otzU >= fogThreshold) {
                 u0 >>= 1;
                 v0 >>= 1;
                 u1 >>= 1;
@@ -566,10 +588,10 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
         DVECTOR sxy1;
         DVECTOR sxy2;
         DVECTOR sxy3;
-        short sz0;
-        short sz1;
-        short sz2;
-        short sz3;
+        int sz0;
+        int sz1;
+        int sz2;
+        int sz3;
         int area;
         u_int areaUnsigned;
         int maxZ;
@@ -670,6 +692,8 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
             subdivideQuad(ctx, subdivDepth, &v0, &v1, &v2, &v3);
         } else {
             POLY_GT4* poly = (POLY_GT4*)ctx->nextPrim;
+            int otz;
+            u_int otzU;
             u_char u0;
             u_char v0;
             u_char u1;
@@ -687,7 +711,7 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
             depthU = maxZ;
             setPolyGT4(poly);
 
-            if (!insertPrim(poly, ctx->ot, depthU, ctx->depthOffset)) {
+            if (!insertPrim(poly, ctx->ot, depthU, ctx->depthOffset, &otz)) {
                 continue;
             }
 
@@ -708,8 +732,9 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
             u3 = quad->u3;
             v3 = quad->v3;
             tpage = quad->tpage;
+            otzU = otz;
 
-            if (depthU >= fogThreshold) {
+            if (otzU >= fogThreshold) {
                 u0 >>= 1;
                 v0 >>= 1;
                 u1 >>= 1;
@@ -795,7 +820,7 @@ void func_8009820C(void* arg0)
     const SkyboxVertex* srcVerts = arg0;
     const SkyboxTri* tris = (const SkyboxTri*)(srcVerts + 34);
     TransformedSkyboxVertex verts[34];
-    u_long* ot = (u_long*)VS_SCRATCH->depthOt + 2047;
+    u_long* ot = VS_SCRATCH->depthOt;
     POLY_G3* poly = VS_SCRATCH->nextPrim;
     int i;
 
@@ -847,9 +872,10 @@ void func_8009820C(void* arg0)
         setPolyG3(poly);
         setXY3(poly, x0, y0, x1, y1, x2, y2);
         setRGB0(poly, v0->color.r, v0->color.g, v0->color.b);
+        poly->code = v0->color.cd;
         setRGB1(poly, v1->color.r, v1->color.g, v1->color.b);
         setRGB2(poly, v2->color.r, v2->color.g, v2->color.b);
-        AddPrim(ot, poly++);
+        AddPrim(&ot[2047], poly++);
     }
 
     VS_SCRATCH->nextPrim = poly;
