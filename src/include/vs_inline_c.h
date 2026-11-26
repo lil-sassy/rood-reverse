@@ -21,6 +21,11 @@
     "nop;" \
     "rtps")
 
+#define gte_rtpt2() __asm__ volatile ( \
+    "nop;" \
+    "nop;" \
+    "rtpt")
+
 #define gte_zrtr() __asm__ volatile (		\
 	"ctc2	$0, $5;"					\
 	"ctc2	$0, $6;"					\

@@ -2,10 +2,13 @@
 #include "2EA3C.h"
 #include "2EA3CPrivate.h"
 #include "146CPrivate.h"
+#include "4DEA8Private.h"
 #include "gpu.h"
 #include "mpd.h"
 #include "scratch.h"
-#include "src/SLUS_010.40/gameFlags.h"
+#include "vs_inline_c.h"
+#include "src/SLUS_010.40/31724.h"
+#include <inline_c.h>
 #include <libgpu.h>
 #include <libgte.h>
 #include <memory.h>
@@ -27,8 +30,8 @@ typedef struct {
 } GeometrySection;
 
 typedef struct {
-    int triCount;
-    int quadCount;
+    u_int triCount;
+    u_int quadCount;
 } MeshHeader;
 
 typedef struct {
@@ -179,47 +182,75 @@ static void unpackSxy(DVECTOR* out, int packed)
     out->vy = packed >> 16;
 }
 
+static int packSxy(DVECTOR sxy)
+{
+    u_int low = sxy.vx & 0xFFFF;
+    u_int high = sxy.vy & 0xFFFF;
+
+    return (high << 16) | low;
+}
+
 static void rotTrans(SVECTOR* in, VECTOR* out)
 {
-    long flag;
-
-    RotTrans(in, out, &flag);
+    gte_ldv0(in);
+    gte_rtv0tr2();
+    gte_stlvnl(out);
 }
 
 static void projectPoint(SVECTOR* in, DVECTOR* outXy, int* outZ)
 {
-    long sxy;
-    long unused;
-    long sz2;
+    int sxy;
+    int sz;
 
-    RotTransPers(in, &sxy, &unused, &unused);
-    ReadSZfifo3(&unused, &unused, &sz2);
+    gte_ldv0(in);
+    gte_rtps2();
+    gte_stsxy(&sxy);
+    gte_stsz(&sz);
     unpackSxy(outXy, sxy);
 
     if (outZ != NULL) {
-        *outZ = sz2;
+        *outZ = sz;
     }
 }
 
 static void projectPoints3(SVECTOR* v0, SVECTOR* v1, SVECTOR* v2, DVECTOR* xy0,
     DVECTOR* xy1, DVECTOR* xy2, int* z0, int* z1, int* z2)
 {
-    long sxy0;
-    long sxy1;
-    long sxy2;
-    long unused;
-    long sz0;
-    long sz1;
-    long sz2;
+    int sxy0;
+    int sxy1;
+    int sxy2;
+    int sz0;
+    int sz1;
+    int sz2;
 
-    RotTransPers3(v0, v1, v2, &sxy0, &sxy1, &sxy2, &unused, &unused);
-    ReadSZfifo3(&sz0, &sz1, &sz2);
-    unpackSxy(xy0, sxy0);
-    unpackSxy(xy1, sxy1);
-    unpackSxy(xy2, sxy2);
-    *z0 = sz0;
-    *z1 = sz1;
-    *z2 = sz2;
+    gte_ldv3(v0, v1, v2);
+    gte_rtpt2();
+    gte_stsxy3(&sxy0, &sxy1, &sxy2);
+    gte_stsz3(&sz0, &sz1, &sz2);
+
+    if (xy0 != NULL) {
+        unpackSxy(xy0, sxy0);
+    }
+
+    if (xy1 != NULL) {
+        unpackSxy(xy1, sxy1);
+    }
+
+    if (xy2 != NULL) {
+        unpackSxy(xy2, sxy2);
+    }
+
+    if (z0 != NULL) {
+        *z0 = sz0;
+    }
+
+    if (z1 != NULL) {
+        *z1 = sz1;
+    }
+
+    if (z2 != NULL) {
+        *z2 = sz2;
+    }
 }
 
 static int isPolyVisible(DVECTOR sxy0, DVECTOR sxy1, DVECTOR sxy2, DVECTOR sxy3)
@@ -247,7 +278,7 @@ static int isPolyVisible(DVECTOR sxy0, DVECTOR sxy1, DVECTOR sxy2, DVECTOR sxy3)
     return 1;
 }
 
-static int insertPrim(void* prim, u_long* ot, u_int depth, int depthOffset, int* outOtz)
+static int computeOtz(u_int depth, int depthOffset, int* outOtz)
 {
     int otz = depth >> 2;
 
@@ -261,12 +292,7 @@ static int insertPrim(void* prim, u_long* ot, u_int depth, int depthOffset, int*
         return 0;
     }
 
-    AddPrim(&ot[otz], prim);
-
-    if (outOtz != NULL) {
-        *outOtz = otz;
-    }
-
+    *outOtz = otz;
     return 1;
 }
 
@@ -276,6 +302,8 @@ static void midpointVertex(
     out->color.r = (a->color.r + b->color.r) >> 1;
     out->color.g = (a->color.g + b->color.g) >> 1;
     out->color.b = (a->color.b + b->color.b) >> 1;
+    // The original leaves the midpoint cd byte untouched in scratchpad memory.
+    out->color.cd = 0;
     setVector(&out->pos, (a->pos.vx + b->pos.vx) >> 1, (a->pos.vy + b->pos.vy) >> 1,
         (a->pos.vz + b->pos.vz) >> 1);
     out->u = (a->u + b->u) >> 1;
@@ -295,6 +323,7 @@ static void subdivideTri(
     if (depth == 0) {
         POLY_GT3* poly = (POLY_GT3*)ctx->nextPrim;
         int maxZ;
+        int otz;
 
         if (!isPolyVisible(v0->sxy, v1->sxy, v2->sxy, v2->sxy)) {
             return;
@@ -310,21 +339,25 @@ static void subdivideTri(
             maxZ = v2->sz;
         }
 
-        setPolyGT3(poly);
+        setXY3(
+            poly, v0->sxy.vx, v0->sxy.vy, v1->sxy.vx, v1->sxy.vy, v2->sxy.vx, v2->sxy.vy);
 
-        if (!insertPrim(poly, ctx->ot, maxZ, ctx->depthOffset, NULL)) {
+        if (!computeOtz(maxZ, ctx->depthOffset, &otz)) {
             return;
         }
 
-        setXY3(
-            poly, v0->sxy.vx, v0->sxy.vy, v1->sxy.vx, v1->sxy.vy, v2->sxy.vx, v2->sxy.vy);
+        setPolyGT3(poly);
+        AddPrim(&ctx->ot[otz], poly);
         setUV3(poly, v0->u, v0->v, v1->u, v1->v, v2->u, v2->v);
         poly->clut = ctx->clut;
         poly->tpage = ctx->tpage;
+        poly->pad2 = 0;
         setRGB0(poly, v0->color.r, v0->color.g, v0->color.b);
-        setRGB1(poly, v1->color.r, v1->color.g, v1->color.b);
-        setRGB2(poly, v2->color.r, v2->color.g, v2->color.b);
         poly->code = ctx->code & ~0x08;
+        setRGB1(poly, v1->color.r, v1->color.g, v1->color.b);
+        poly->p1 = v1->color.cd;
+        setRGB2(poly, v2->color.r, v2->color.g, v2->color.b);
+        poly->p2 = v2->color.cd;
         ctx->nextPrim += sizeof(POLY_GT3);
         return;
     }
@@ -364,6 +397,7 @@ static void subdivideQuad(SubdivContext* ctx, int depth, SubdivVertex* v0,
     if (depth == 0) {
         POLY_GT4* poly = (POLY_GT4*)ctx->nextPrim;
         int maxZ;
+        int otz;
 
         if (!isPolyVisible(v0->sxy, v1->sxy, v2->sxy, v3->sxy)) {
             return;
@@ -383,22 +417,28 @@ static void subdivideQuad(SubdivContext* ctx, int depth, SubdivVertex* v0,
             maxZ = v3->sz;
         }
 
-        setPolyGT4(poly);
+        setXY4(poly, v0->sxy.vx, v0->sxy.vy, v1->sxy.vx, v1->sxy.vy, v2->sxy.vx,
+            v2->sxy.vy, v3->sxy.vx, v3->sxy.vy);
 
-        if (!insertPrim(poly, ctx->ot, maxZ, ctx->depthOffset, NULL)) {
+        if (!computeOtz(maxZ, ctx->depthOffset, &otz)) {
             return;
         }
 
-        setXY4(poly, v0->sxy.vx, v0->sxy.vy, v1->sxy.vx, v1->sxy.vy, v2->sxy.vx,
-            v2->sxy.vy, v3->sxy.vx, v3->sxy.vy);
+        setPolyGT4(poly);
+        AddPrim(&ctx->ot[otz], poly);
         setUV4(poly, v0->u, v0->v, v1->u, v1->v, v2->u, v2->v, v3->u, v3->v);
         poly->clut = ctx->clut;
         poly->tpage = ctx->tpage;
+        poly->pad2 = 0;
+        poly->pad3 = 0;
         setRGB0(poly, v0->color.r, v0->color.g, v0->color.b);
-        setRGB1(poly, v1->color.r, v1->color.g, v1->color.b);
-        setRGB2(poly, v2->color.r, v2->color.g, v2->color.b);
-        setRGB3(poly, v3->color.r, v3->color.g, v3->color.b);
         poly->code = ctx->code;
+        setRGB1(poly, v1->color.r, v1->color.g, v1->color.b);
+        poly->p1 = v1->color.cd;
+        setRGB2(poly, v2->color.r, v2->color.g, v2->color.b);
+        poly->p2 = v2->color.cd;
+        setRGB3(poly, v3->color.r, v3->color.g, v3->color.b);
+        poly->p3 = v3->color.cd;
         ctx->nextPrim += sizeof(POLY_GT4);
         return;
     }
@@ -414,8 +454,8 @@ static void subdivideQuad(SubdivContext* ctx, int depth, SubdivVertex* v0,
 
     midpointVertex(&m32, v3, v2);
     midpointVertex(&m02, v0, v2);
-    projectPoint(&m32.pos, &m32.sxy, &sz0);
-    projectPoint(&m02.pos, &m02.sxy, &sz1);
+    projectPoints3(
+        &m32.pos, &m02.pos, &m31.pos, &m32.sxy, &m02.sxy, NULL, &sz0, &sz1, NULL);
     m32.sz = sz0;
     m02.sz = sz1;
 
@@ -431,15 +471,19 @@ static void subdivideQuad(SubdivContext* ctx, int depth, SubdivVertex* v0,
     subdivideTri(ctx, 0, v3, &m31, v1);
 }
 
-static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShift,
+static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexScale,
     int subdivLevel, int enableSubdiv)
 {
+    // The original primes the first record and reads ahead at mesh boundaries.
     const MpdTriangle* tri = (const MpdTriangle*)(mesh + 1);
     const MpdQuad* quad;
+    u_int packedCounts = mesh->triCount | (mesh->quadCount << 16);
+    u_int triCount = packedCounts & 0xFFFF;
+    u_int quadCount = packedCounts >> 16;
     u_int fogThreshold = fogDepth;
-    int i;
+    u_int i;
 
-    for (i = 0; i < mesh->triCount; ++i, ++tri) {
+    for (i = 0; i < triCount; ++i, ++tri) {
         SVECTOR p0;
         SVECTOR p1;
         SVECTOR p2;
@@ -456,14 +500,13 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
         int subdivDepth;
 
         setVector(&p0, tri->x0, tri->y0, tri->z0);
-        setVector(&p1, tri->x0 + (tri->dx1 << vertexShift),
-            tri->y0 + (tri->dy1 << vertexShift), tri->z0 + (tri->dz1 << vertexShift));
-        setVector(&p2, tri->x0 + (tri->dx2 << vertexShift),
-            tri->y0 + (tri->dy2 << vertexShift), tri->z0 + (tri->dz2 << vertexShift));
+        setVector(&p1, tri->x0 + tri->dx1 * vertexScale, tri->y0 + tri->dy1 * vertexScale,
+            tri->z0 + tri->dz1 * vertexScale);
+        setVector(&p2, tri->x0 + tri->dx2 * vertexScale, tri->y0 + tri->dy2 * vertexScale,
+            tri->z0 + tri->dz2 * vertexScale);
 
         projectPoints3(&p0, &p1, &p2, &sxy0, &sxy1, &sxy2, &sz0, &sz1, &sz2);
-        area = NormalClip(vs_getXY(sxy0.vx, sxy0.vy), vs_getXY(sxy1.vx, sxy1.vy),
-            vs_getXY(sxy2.vx, sxy2.vy));
+        area = NormalClip(packSxy(sxy0), packSxy(sxy1), packSxy(sxy2));
 
         if (area < 0) {
             if (!(tri->code & 1)) {
@@ -502,6 +545,7 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
             v0.color.r = tri->r0;
             v0.color.g = tri->g0;
             v0.color.b = tri->b0;
+            v0.color.cd = 1;
             v0.sxy = sxy0;
             v0.sz = sz0;
 
@@ -511,6 +555,7 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
             v1.color.r = tri->r1;
             v1.color.g = tri->g1;
             v1.color.b = tri->b1;
+            v1.color.cd = 1;
             v1.sxy = sxy1;
             v1.sz = sz1;
 
@@ -520,6 +565,7 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
             v2.color.r = tri->r2;
             v2.color.g = tri->g2;
             v2.color.b = tri->b2;
+            v2.color.cd = 1;
             v2.sxy = sxy2;
             v2.sz = sz2;
 
@@ -539,17 +585,20 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
             u_char v2;
             u_short tpage;
 
-            setPolyGT3(poly);
+            setXY3(poly, sxy0.vx, sxy0.vy, sxy1.vx, sxy1.vy, sxy2.vx, sxy2.vy);
 
-            if (!insertPrim(poly, ctx->ot, depthU, ctx->depthOffset, &otz)) {
+            if (!computeOtz(depthU, ctx->depthOffset, &otz)) {
                 continue;
             }
 
-            setXY3(poly, sxy0.vx, sxy0.vy, sxy1.vx, sxy1.vy, sxy2.vx, sxy2.vy);
+            setPolyGT3(poly);
+            AddPrim(&ctx->ot[otz], poly);
             setRGB0(poly, tri->r0, tri->g0, tri->b0);
             poly->code = tri->code & ~1;
             setRGB1(poly, tri->r1, tri->g1, tri->b1);
+            poly->p1 = tri->u2;
             setRGB2(poly, tri->r2, tri->g2, tri->b2);
+            poly->p2 = tri->v2;
 
             u0 = tri->u0;
             v0 = tri->v0;
@@ -573,13 +622,14 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
             setUV3(poly, u0, v0, u1, v1, u2, v2);
             poly->clut = tri->clut;
             poly->tpage = tpage;
+            poly->pad2 = 0;
             ctx->nextPrim += sizeof(POLY_GT3);
         }
     }
 
     quad = (const MpdQuad*)tri;
 
-    for (i = 0; i < mesh->quadCount; ++i, ++quad) {
+    for (i = 0; i < quadCount; ++i, ++quad) {
         SVECTOR p0;
         SVECTOR p1;
         SVECTOR p2;
@@ -600,16 +650,15 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
         int subdivDepth;
 
         setVector(&p0, quad->x0, quad->y0, quad->z0);
-        setVector(&p1, quad->x0 + (quad->dx1 << vertexShift),
-            quad->y0 + (quad->dy1 << vertexShift), quad->z0 + (quad->dz1 << vertexShift));
-        setVector(&p2, quad->x0 + (quad->dx2 << vertexShift),
-            quad->y0 + (quad->dy2 << vertexShift), quad->z0 + (quad->dz2 << vertexShift));
-        setVector(&p3, quad->x0 + (quad->dx3 << vertexShift),
-            quad->y0 + (quad->dy3 << vertexShift), quad->z0 + (quad->dz3 << vertexShift));
+        setVector(&p1, quad->x0 + quad->dx1 * vertexScale,
+            quad->y0 + quad->dy1 * vertexScale, quad->z0 + quad->dz1 * vertexScale);
+        setVector(&p2, quad->x0 + quad->dx2 * vertexScale,
+            quad->y0 + quad->dy2 * vertexScale, quad->z0 + quad->dz2 * vertexScale);
+        setVector(&p3, quad->x0 + quad->dx3 * vertexScale,
+            quad->y0 + quad->dy3 * vertexScale, quad->z0 + quad->dz3 * vertexScale);
 
         projectPoints3(&p0, &p1, &p2, &sxy0, &sxy1, &sxy2, &sz0, &sz1, &sz2);
-        area = NormalClip(vs_getXY(sxy0.vx, sxy0.vy), vs_getXY(sxy1.vx, sxy1.vy),
-            vs_getXY(sxy2.vx, sxy2.vy));
+        area = NormalClip(packSxy(sxy0), packSxy(sxy1), packSxy(sxy2));
         visible = (quad->code & 1) || (area >= 0);
 
         projectPoint(&p3, &sxy3, &sz3);
@@ -619,8 +668,7 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
         }
 
         if (!visible) {
-            area = NormalClip(vs_getXY(sxy3.vx, sxy3.vy), vs_getXY(sxy2.vx, sxy2.vy),
-                vs_getXY(sxy1.vx, sxy1.vy));
+            area = NormalClip(packSxy(sxy3), packSxy(sxy2), packSxy(sxy1));
 
             if (area < 0) {
                 continue;
@@ -638,8 +686,8 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
         }
 
         // Potential bug in original, needs investigating.
-        // For quads, a negative area on a double-sided face is not negated before the
-        // unsigned >= 512 check, and subdivision depth ignores sz3.
+        // Back-facing double-sided quads skip negation and always pass the unsigned >=
+        // 512 subdivision check, and quad subdivision depth ignores sz3.
         depthU = maxZ;
         areaUnsigned = area;
         subdivDepth = subdivLevel - (depthU >> 9);
@@ -656,6 +704,7 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
             v0.color.r = quad->r0;
             v0.color.g = quad->g0;
             v0.color.b = quad->b0;
+            v0.color.cd = 1;
             v0.sxy = sxy0;
             v0.sz = sz0;
 
@@ -665,6 +714,7 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
             v1.color.r = quad->r1;
             v1.color.g = quad->g1;
             v1.color.b = quad->b1;
+            v1.color.cd = 1;
             v1.sxy = sxy1;
             v1.sz = sz1;
 
@@ -674,6 +724,7 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
             v2.color.r = quad->r2;
             v2.color.g = quad->g2;
             v2.color.b = quad->b2;
+            v2.color.cd = 1;
             v2.sxy = sxy2;
             v2.sz = sz2;
 
@@ -683,6 +734,7 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
             v3.color.r = quad->r3;
             v3.color.g = quad->g3;
             v3.color.b = quad->b3;
+            v3.color.cd = 1;
             v3.sxy = sxy3;
             v3.sz = sz3;
 
@@ -709,19 +761,24 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
             }
 
             depthU = maxZ;
-            setPolyGT4(poly);
+            setXY3(poly, sxy0.vx, sxy0.vy, sxy1.vx, sxy1.vy, sxy2.vx, sxy2.vy);
 
-            if (!insertPrim(poly, ctx->ot, depthU, ctx->depthOffset, &otz)) {
+            if (!computeOtz(depthU, ctx->depthOffset, &otz)) {
                 continue;
             }
 
-            setXY4(poly, sxy0.vx, sxy0.vy, sxy1.vx, sxy1.vy, sxy2.vx, sxy2.vy, sxy3.vx,
-                sxy3.vy);
+            setPolyGT4(poly);
+            AddPrim(&ctx->ot[otz], poly);
+            poly->x3 = sxy3.vx;
+            poly->y3 = sxy3.vy;
             setRGB0(poly, quad->r0, quad->g0, quad->b0);
             poly->code = quad->code & ~1;
             setRGB1(poly, quad->r1, quad->g1, quad->b1);
+            poly->p1 = quad->u2;
             setRGB2(poly, quad->r2, quad->g2, quad->b2);
+            poly->p2 = quad->v2;
             setRGB3(poly, quad->r3, quad->g3, quad->b3);
+            poly->p3 = quad->v3;
 
             u0 = quad->u0;
             v0 = quad->v0;
@@ -749,6 +806,8 @@ static void renderMesh(SubdivContext* ctx, const MeshHeader* mesh, int vertexShi
             setUV4(poly, u0, v0, u1, v1, u2, v2, u3, v3);
             poly->clut = quad->clut;
             poly->tpage = tpage;
+            poly->pad2 = 0;
+            poly->pad3 = 0;
             ctx->nextPrim += sizeof(POLY_GT4);
         }
     }
@@ -764,12 +823,13 @@ void func_8009723C(void* arg0, int arg1)
     ctx.nextPrim = startPrim;
     ctx.ot = VS_SCRATCH->depthOt;
 
+    // The original loop is post-tested and assumes count > 0.
     for (i = 0; i < section->count; ++i) {
         GeometryObject* obj = &section->objects[i];
         u_short flags = obj->flags;
         u_int viewFacing = VS_SCRATCH->firstPersonViewFacing;
         const MeshHeader* mesh;
-        int vertexShift;
+        int vertexScale;
         int subdivLevel;
 
         if (ctx.nextPrim - startPrim >= 65536) {
@@ -788,14 +848,14 @@ void func_8009723C(void* arg0, int arg1)
             continue;
         }
 
-        vertexShift = (flags & 0x800) ? 0 : 3;
+        vertexScale = (flags & 0x800) ? 1 : 8;
         subdivLevel = (flags >> 13) & 3;
         ctx.depthOffset = obj->depthOffset;
 
         SetRotMatrix(&obj->matrix);
         SetTransMatrix(&obj->matrix);
         mesh = (const MeshHeader*)((u_char*)arg0 + obj->meshOffset);
-        renderMesh(&ctx, mesh, vertexShift, subdivLevel, arg1);
+        renderMesh(&ctx, mesh, vertexScale, subdivLevel, arg1);
     }
 
     VS_SCRATCH->nextPrim = ctx.nextPrim;
@@ -846,12 +906,12 @@ void func_8009820C(void* arg0)
             continue;
         }
 
-        x0 = v0->pos.vx + 160;
-        x1 = v1->pos.vx + 160;
-        x2 = v2->pos.vx + 160;
-        y0 = v0->pos.vy + 120;
-        y1 = v1->pos.vy + 120;
-        y2 = v2->pos.vy + 120;
+        x0 = (u_int)v0->pos.vx + 160;
+        x1 = (u_int)v1->pos.vx + 160;
+        x2 = (u_int)v2->pos.vx + 160;
+        y0 = (u_int)v0->pos.vy + 120;
+        y1 = (u_int)v1->pos.vy + 120;
+        y2 = (u_int)v2->pos.vy + 120;
 
         if ((x0 < 0) && (x1 < 0) && (x2 < 0)) {
             continue;
@@ -874,7 +934,9 @@ void func_8009820C(void* arg0)
         setRGB0(poly, v0->color.r, v0->color.g, v0->color.b);
         poly->code = v0->color.cd;
         setRGB1(poly, v1->color.r, v1->color.g, v1->color.b);
+        poly->pad1 = v1->color.cd;
         setRGB2(poly, v2->color.r, v2->color.g, v2->color.b);
+        poly->pad2 = v2->color.cd;
         AddPrim(&ot[2047], poly++);
     }
 
@@ -888,14 +950,17 @@ void func_800983F8(void* arg0)
     // 0x1F800398/0x1F80039C.
     GeometrySection* section = arg0;
     int roll = VS_SCRATCH->camera.angles.vz;
-    int farClip = VS_SCRATCH->camera.farClip;
-    int sinRoll = (rsin(roll) * farClip) >> 12;
-    int cosRoll = (rcos(roll) * farClip) >> 12;
+    u_int farClip = VS_SCRATCH->camera.farClip;
+    int sinProd = rsin(roll) * farClip;
+    int cosProd = rcos(roll) * farClip;
+    int sinRoll = sinProd >> 12;
+    int cosRoll = cosProd >> 12;
     VECTOR zeroVec;
     int i;
 
     setVector(&zeroVec, 0, 0, 0);
 
+    // The original loop is post-tested and assumes count > 0.
     for (i = 0; i < section->count; ++i) {
         GeometryObject* obj = &section->objects[i];
 
@@ -913,12 +978,16 @@ void func_800983F8(void* arg0)
         } else {
             MATRIX tempMatrix;
             SVECTOR pos;
+            VECTOR trans;
 
             func_800985AC(&zeroVec, &zeroVec, &tempMatrix);
             SetRotMatrix(&tempMatrix);
             SetTransMatrix(&tempMatrix);
             setVector(&pos, obj->pos[0], obj->pos[1], obj->pos[2]);
-            rotTrans(&pos, (VECTOR*)obj->matrix.t);
+            rotTrans(&pos, &trans);
+            obj->matrix.t[0] = trans.vx;
+            obj->matrix.t[1] = trans.vy;
+            obj->matrix.t[2] = trans.vz;
 
             obj->matrix.m[0][0] = cosRoll;
             obj->matrix.m[0][1] = -sinRoll;
@@ -936,13 +1005,16 @@ void func_800985AC(VECTOR* pos, VECTOR* rot, MATRIX* out)
 {
     SVECTOR angles;
     SVECTOR translation;
+    VECTOR trans;
 
     setVector(&angles, rot->vx, rot->vy, rot->vz);
     RotMatrixYXZ_gte(&angles, out);
-    MulMatrix2(&VS_SCRATCH->viewMatrix, out);
-    SetRotMatrix(&VS_SCRATCH->viewMatrix);
+    func_80041C68(&VS_SCRATCH->viewMatrix, out);
     setVector(&translation, pos->vx, pos->vy, pos->vz);
-    rotTrans(&translation, (VECTOR*)out->t);
+    rotTrans(&translation, &trans);
+    out->t[0] = trans.vx;
+    out->t[1] = trans.vy;
+    out->t[2] = trans.vz;
 }
 
 void func_80098648(VECTOR* pos, VECTOR* rot, MATRIX* out)
@@ -951,7 +1023,9 @@ void func_80098648(VECTOR* pos, VECTOR* rot, MATRIX* out)
     MATRIX view = VS_SCRATCH->viewMatrix;
     SVECTOR angles;
     SVECTOR translation;
-    int invScale = (ONE * ONE) / VS_SCRATCH->camera.farClip;
+    VECTOR trans;
+    int farClip = VS_SCRATCH->camera.farClip;
+    int invScale = (farClip != 0) ? ((ONE * ONE) / farClip) : -1;
 
     memset(&scale, 0, sizeof scale);
     scale.m[0][0] = invScale;
@@ -960,15 +1034,20 @@ void func_80098648(VECTOR* pos, VECTOR* rot, MATRIX* out)
 
     setVector(&angles, rot->vx, rot->vy, rot->vz);
     RotMatrixYXZ_gte(&angles, out);
-    MulMatrix2(&scale, &view);
-    MulMatrix2(&view, out);
-    SetRotMatrix(&view);
+    func_80041C68(&scale, &view);
+    func_80041C68(&view, out);
     setVector(&translation, pos->vx, pos->vy, pos->vz);
-    rotTrans(&translation, (VECTOR*)out->t);
+    rotTrans(&translation, &trans);
+    out->t[0] = trans.vx;
+    out->t[1] = trans.vy;
+    out->t[2] = trans.vz;
 }
 
 void func_80098B1C(void)
 {
+    // The original tail-jumps directly to sectionE->unk14 with $ra and argument
+    // registers intact; assumes a no-argument call since no callers or populated
+    // section E entries were found.
     void (*entry)(void) = (void (*)(void))vs_battle_roomData.sectionE->unk14;
 
     entry();
@@ -976,17 +1055,17 @@ void func_80098B1C(void)
 
 static int interpolateLightTri(int xz, CVECTOR* outColor, const LightingTri* tri)
 {
-    int v0 = vs_getXY(tri->v0.vx, tri->v0.vy);
-    int v1 = vs_getXY(tri->v1.vx, tri->v1.vy);
-    int v2 = vs_getXY(tri->v2.vx, tri->v2.vy);
+    int v0 = packSxy(tri->v0);
+    int v1 = packSxy(tri->v1);
+    int v2 = packSxy(tri->v2);
     int area = NormalClip(v0, v2, v1);
     int w0;
     int w2;
     int w1;
+    u_int areaU;
     u_int weight0;
     u_int weight1;
     u_int weight2;
-    u_int totalArea;
 
     if (area <= 0) {
         return 0;
@@ -1004,23 +1083,23 @@ static int interpolateLightTri(int xz, CVECTOR* outColor, const LightingTri* tri
         return 0;
     }
 
-    w1 = area - w0 - w2;
+    areaU = area;
+    weight0 = w0;
+    weight2 = w2;
+    w1 = areaU - weight0 - weight2;
 
     if (w1 < 0) {
         return 0;
     }
 
-    weight0 = w0;
     weight1 = w1;
-    weight2 = w2;
-    totalArea = area;
 
     outColor->r = clampColor(
-        (tri->c0.r * weight0 + tri->c2.r * weight2 + tri->c1.r * weight1) / totalArea);
+        (tri->c0.r * weight0 + tri->c2.r * weight2 + tri->c1.r * weight1) / areaU);
     outColor->g = clampColor(
-        (tri->c0.g * weight0 + tri->c2.g * weight2 + tri->c1.g * weight1) / totalArea);
+        (tri->c0.g * weight0 + tri->c2.g * weight2 + tri->c1.g * weight1) / areaU);
     outColor->b = clampColor(
-        (tri->c0.b * weight0 + tri->c2.b * weight2 + tri->c1.b * weight1) / totalArea);
+        (tri->c0.b * weight0 + tri->c2.b * weight2 + tri->c1.b * weight1) / areaU);
     return 1;
 }
 
@@ -1031,8 +1110,8 @@ int func_80098B38(int xz, int layer, CVECTOR* outColor)
     const LightingTri* tri;
     int posX;
     int posZ;
-    int count;
-    int i;
+    u_int count;
+    u_int i;
 
     defaultColor.r = 128;
     defaultColor.g = 128;
@@ -1070,23 +1149,31 @@ int func_80098B38(int xz, int layer, CVECTOR* outColor)
     return 0;
 }
 
-static void tintColor(CVECTOR* color, int dr, int dg, int db, int desat)
+static void tintColor(
+    u_char* r, u_char* g, u_char* b, u_char cd, int dr, int dg, int db, int desat)
 {
-    int red = color->r;
-    int green = color->g;
-    int blue = color->b;
+    int red = *r;
+    int green = *g;
+    int blue = *b;
 
     if (desat != 0) {
+        CVECTOR color;
         int gray = red * 5 + green * 9 + blue * 2;
 
-        red = clampColor(red + (((gray - (red << 4)) * desat) >> 16));
-        green = clampColor(green + (((gray - (green << 4)) * desat) >> 16));
-        blue = clampColor(blue + (((gray - (blue << 4)) * desat) >> 16));
+        color.r = red;
+        color.g = green;
+        color.b = blue;
+        color.cd = cd;
+        gte_ldfcdir(gray, gray, gray);
+        DpqColor(&color, desat, &color);
+        red = color.r;
+        green = color.g;
+        blue = color.b;
     }
 
-    color->r = clampColor(red + dr);
-    color->g = clampColor(green + dg);
-    color->b = clampColor(blue + db);
+    *r = clampColor(red + dr);
+    *g = clampColor(green + dg);
+    *b = clampColor(blue + db);
 }
 
 void func_80098D6C(void* start, void* end, D_800F1BB0_t* colorMod, int flags)
@@ -1114,17 +1201,17 @@ void func_80098D6C(void* start, void* end, D_800F1BB0_t* colorMod, int flags)
         if (len == 9) {
             POLY_GT3* poly = (POLY_GT3*)cur;
 
-            tintColor((CVECTOR*)&poly->r0, dr, dg, db, desat);
-            tintColor((CVECTOR*)&poly->r1, dr, dg, db, desat);
-            tintColor((CVECTOR*)&poly->r2, dr, dg, db, desat);
+            tintColor(&poly->r0, &poly->g0, &poly->b0, poly->code, dr, dg, db, desat);
+            tintColor(&poly->r1, &poly->g1, &poly->b1, poly->p1, dr, dg, db, desat);
+            tintColor(&poly->r2, &poly->g2, &poly->b2, poly->p2, dr, dg, db, desat);
             cur += sizeof(POLY_GT3) + extra;
         } else if (len == 12) {
             POLY_GT4* poly = (POLY_GT4*)cur;
 
-            tintColor((CVECTOR*)&poly->r0, dr, dg, db, desat);
-            tintColor((CVECTOR*)&poly->r1, dr, dg, db, desat);
-            tintColor((CVECTOR*)&poly->r2, dr, dg, db, desat);
-            tintColor((CVECTOR*)&poly->r3, dr, dg, db, desat);
+            tintColor(&poly->r0, &poly->g0, &poly->b0, poly->code, dr, dg, db, desat);
+            tintColor(&poly->r1, &poly->g1, &poly->b1, poly->p1, dr, dg, db, desat);
+            tintColor(&poly->r2, &poly->g2, &poly->b2, poly->p2, dr, dg, db, desat);
+            tintColor(&poly->r3, &poly->g3, &poly->b3, poly->p3, dr, dg, db, desat);
             cur += sizeof(POLY_GT4) + extra;
         } else {
             break;
@@ -1138,6 +1225,7 @@ vs_RoomName* vs_battle_initSceneAndGetRoomNames(void* arg0)
     void* data = &scene->rooms[scene->roomCount];
     int i;
 
+    // The original loops are post-tested and assume roomCount > 0.
     for (i = 0; i < scene->roomCount; ++i) {
         u_long size = (u_long)scene->rooms[i].dataAddress;
 
@@ -1163,11 +1251,12 @@ void func_80098F8C(void* arg0)
     trans.t[2] = 256;
     SetTransMatrix(&trans);
 
+    // The original loop is post-tested and assumes roomCount > 0.
     for (roomIdx = 0; roomIdx < scene->roomCount; ++roomIdx) {
         vs_Room* room = &scene->rooms[roomIdx];
         const u_int* cursor;
         const SVECTOR* verts;
-        DVECTOR screenPts[256];
+        DVECTOR screenPts[258];
         int count;
         int i;
 
@@ -1185,10 +1274,13 @@ void func_80098F8C(void* arg0)
 
         verts = (const SVECTOR*)cursor;
 
-        for (i = 0; i < count; ++i) {
-            SVECTOR vert = verts[i];
+        for (i = 0; i < count; i += 3) {
+            SVECTOR v0 = verts[i];
+            SVECTOR v1 = verts[i + 1];
+            SVECTOR v2 = verts[i + 2];
 
-            projectPoint(&vert, &screenPts[i], NULL);
+            projectPoints3(&v0, &v1, &v2, &screenPts[i], &screenPts[i + 1],
+                &screenPts[i + 2], NULL, NULL, NULL);
         }
 
         cursor = (const u_int*)(verts + count);
@@ -1285,7 +1377,7 @@ void func_80098F8C(void* arg0)
             const vs_RoomDoor* door = (const vs_RoomDoor*)&cursor[i];
             DVECTOR pt = screenPts[door->vertex];
 
-            if ((door->unk3 != 0) && (vs_main_stateFlags.unk33F[door->unk3] == 0)) {
+            if ((door->unk3 != 0) && (getStateFlag(0x33F + door->unk3) == 0)) {
                 SPRT_8* sprt = (SPRT_8*)prim;
 
                 setSprt8(sprt);
@@ -1343,23 +1435,23 @@ void func_80098F8C(void* arg0)
     mode = (DR_MODE*)prim;
     SetDrawMode(mode, 0, 1, getTPage(0, 0, 768, 0), NULL);
     AddPrim(&ot[5], mode);
-    prim += sizeof(DR_MODE);
+    prim += 16;
 
     mode = (DR_MODE*)prim;
     SetDrawMode(mode, 0, 1, getTPage(0, 0, 768, 0), NULL);
     AddPrim(&ot[4], mode);
-    prim += sizeof(DR_MODE);
+    prim += 16;
 
     VS_SCRATCH->nextPrim = prim;
 }
 
 void vs_battle_getGeomOffset(vs_GeomOffset* offset)
 {
-    long offsetX;
-    long offsetY;
+    int offsetX;
+    int offsetY;
 
     // The original shifts OFX and OFY logically (srl 16), zero-extending them.
-    ReadGeomOffset(&offsetX, &offsetY);
+    gte_ReadGeomOffset(&offsetX, &offsetY);
     offset->x = offsetX & 0xFFFF;
     offset->y = offsetY & 0xFFFF;
 }
